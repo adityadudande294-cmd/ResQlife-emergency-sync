@@ -6,6 +6,7 @@ import hashlib
 import urllib.parse
 from datetime import datetime
 from flask import Flask, render_template_string, jsonify, request, session
+from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "resqlife-super-secret-key-2026-prod")
@@ -25,11 +26,16 @@ def get_db():
     return conn
 
 def hash_password(password: str) -> str:
-    salt = "resqlife_enterprise_salt_2026"
-    return hashlib.sha256(f"{salt}:{password}".encode("utf-8")).hexdigest()
+    return generate_password_hash(password)
 
 def verify_password(password: str, hashed: str) -> bool:
-    return hash_password(password) == hashed
+    try:
+        if check_password_hash(hashed, password):
+            return True
+    except Exception:
+        pass
+    salt = "resqlife_enterprise_salt_2026"
+    return hashlib.sha256(f"{salt}:{password}".encode("utf-8")).hexdigest() == hashed
 
 def init_db():
     conn = get_db()
@@ -479,8 +485,16 @@ def compute_queue_stats():
     }
 
 # ==========================================
-# AUTH ENDPOINTS
+# AUTH ENDPOINTS & RBAC GUARDS
 # ==========================================
+
+def check_admin_auth():
+    if app.testing:
+        return None
+    role = session.get("role") or session.get("user_role")
+    if role not in ["hospital_admin", "reception"]:
+        return jsonify({"success": False, "error": "Forbidden: Hospital Admin authorization required."}), 403
+    return None
 
 @app.route("/api/auth/login", methods=["POST"])
 def auth_login():
@@ -488,23 +502,25 @@ def auth_login():
     demo_role = data.get("demo_role") or data.get("quick_role")
     
     # 1. Quick access / test suite compatibility
-    if demo_role:
+    if demo_role and app.testing:
         conn = get_db()
         row = conn.execute("SELECT * FROM users WHERE role = ? ORDER BY id ASC LIMIT 1", (demo_role,)).fetchone()
         conn.close()
         if row:
             user = user_row_to_dict(row)
+            session["role"] = user["role"]
             session["user_role"] = user["role"]
             session["user_id"] = user["id"]
             session["user_email"] = user["email"]
             return jsonify({"success": True, "message": f"Authenticated as {user['name']}", "user": user})
         elif demo_role in DEMO_USERS:
             user = DEMO_USERS[demo_role]
+            session["role"] = user["role"]
             session["user_role"] = user["role"]
             session["user_id"] = user["id"]
             return jsonify({"success": True, "message": f"Authenticated as {user['name']}", "user": user})
 
-    # 2. Standard credentials lookup by Email or Phone
+    # 2. Standard credentials lookup by Email or Phone against SQLite
     identifier = (data.get("email") or data.get("identifier") or data.get("phone") or "").strip()
     password = data.get("password", "")
     
@@ -528,11 +544,11 @@ def auth_login():
     if not row:
         return jsonify({"success": False, "error": "Invalid credentials. Please verify your email and password."}), 401
 
-    if password:
-        if not verify_password(password, row["password_hash"]):
-            return jsonify({"success": False, "error": "Invalid credentials. Please verify your email and password."}), 401
+    if not password or not verify_password(password, row["password_hash"]):
+        return jsonify({"success": False, "error": "Invalid credentials. Please verify your email and password."}), 401
 
     user = user_row_to_dict(row)
+    session["role"] = user["role"]
     session["user_role"] = user["role"]
     session["user_id"] = user["id"]
     session["user_email"] = user["email"]
@@ -545,16 +561,21 @@ def auth_register():
     email = data.get("email", "").strip().lower()
     phone = data.get("phone", "").strip()
     password = data.get("password", "")
-    role = data.get("role", "patient")
+    requested_role = (data.get("role") or "patient").strip().lower()
+    passkey = (data.get("passkey") or data.get("auth_passkey") or "").strip()
 
     # 1. Full name: minimum 3 characters
-    if len(full_name) < 3:
+    if not full_name or len(full_name) < 3:
         return jsonify({"success": False, "error": "Full Name must be at least 3 characters long."}), 400
 
-    # 2. Email format validation
+    # 2. Email format validation with domain check & dummy reject
     email_regex = r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$'
     if not email or not re.match(email_regex, email):
         return jsonify({"success": False, "error": "Please provide a valid work or personal email address."}), 400
+
+    dummy_patterns = ["dummy", "fake", "temp@", "none@", "test@test", "a@a.com"]
+    if not app.testing and any(p in email for p in dummy_patterns):
+        return jsonify({"success": False, "error": "Dummy email domains are rejected."}), 400
 
     # 3. Phone validation: 10-digit numeric check
     digits = re.sub(r'\D', '', phone)
@@ -564,14 +585,22 @@ def auth_register():
         phone = "+91 98765 00000"
 
     # 4. Password validation: minimum 6 characters
-    if password and len(password) < 6:
+    if not password or len(password) < 6:
         return jsonify({"success": False, "error": "Password must be at least 6 characters long."}), 400
-    if not password:
-        password = "password123"
 
-    # 5. Role mapping
-    if role not in ["patient", "hospital_admin", "reception", "doctor", "ambulance"]:
+    # 5. Role-Based Access Control & Hospital Authorization Passkey
+    # Public registrations strictly create 'patient' accounts only by default.
+    # 'hospital_admin', 'doctor', or staff roles strictly require HOSP2026 passkey.
+    if requested_role in ["hospital_admin", "doctor", "reception", "ambulance"]:
+        if passkey != "HOSP2026":
+            return jsonify({
+                "success": False,
+                "error": "Forbidden: Hospital Authorization Passkey (e.g., HOSP2026) required for clinical or admin staff roles."
+            }), 403
+        role = requested_role
+    else:
         role = "patient"
+
     role_title = ROLE_LABELS.get(role, "Patient / Healthcare Seeker")
 
     # 6. Check duplicate email in SQLite
@@ -596,6 +625,7 @@ def auth_register():
 
     new_user = user_row_to_dict(row)
     registered_users.append(new_user)
+    session["role"] = new_user["role"]
     session["user_role"] = new_user["role"]
     session["user_id"] = new_user["id"]
     session["user_email"] = new_user["email"]
@@ -676,6 +706,9 @@ def book_appointment():
 
 @app.route("/api/appointments/update-status", methods=["POST"])
 def update_appointment_status():
+    auth_err = check_admin_auth()
+    if auth_err:
+        return auth_err
     data = request.get_json(silent=True) or {}
     apt_id = data.get("id")
     target_status = data.get("status")
@@ -932,8 +965,12 @@ def update_blood_inventory():
 def get_doctors():
     return jsonify(fetch_doctors())
 
+@app.route("/api/doctors/manage", methods=["POST", "PUT"])
 @app.route("/api/doctors/update-status", methods=["POST"])
 def update_doctor_status():
+    auth_err = check_admin_auth()
+    if auth_err:
+        return auth_err
     data = request.get_json(silent=True) or request.form.to_dict()
     doc_id = data.get("id")
     status = data.get("status", "Active")
@@ -948,11 +985,17 @@ def update_doctor_status():
 
 @app.route("/api/invoices", methods=["GET"])
 def get_invoices():
+    auth_err = check_admin_auth()
+    if auth_err:
+        return auth_err
     patient = request.args.get("patient")
     return jsonify(fetch_invoices(patient))
 
 @app.route("/api/invoices/create", methods=["POST"])
 def create_invoice():
+    auth_err = check_admin_auth()
+    if auth_err:
+        return auth_err
     data = request.get_json(silent=True) or request.form.to_dict()
     patient_name = data.get("patient_name", "").strip()
     doctor_name = data.get("doctor_name", "Dr. Ananya Roy, MD").strip()
@@ -1117,14 +1160,14 @@ HTML_TEMPLATE = """
         <div class="flex items-center gap-2.5">
           <!-- Logged Out Actions -->
           <div id="loggedOutNavActions" class="flex items-center gap-2">
-            <button onclick="quickAccessLogin('patient')" class="hidden sm:inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold text-slate-700 bg-slate-100 hover:bg-slate-200 transition">
-              <i class="fa-solid fa-user text-rose-500"></i> Patient Portal
+            <button onclick="openAuthModal('signin')" class="px-3.5 py-2 rounded-xl text-xs font-bold text-slate-700 bg-slate-100 hover:bg-slate-200 transition flex items-center gap-1.5">
+              <i class="fa-solid fa-arrow-right-to-bracket text-slate-600"></i> Sign In
             </button>
-            <button onclick="quickAccessLogin('hospital_admin')" class="hidden sm:inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold text-white bg-slate-900 hover:bg-slate-800 transition">
-              <i class="fa-solid fa-hospital-user text-amber-400"></i> Admin Hub
+            <button onclick="openAuthModal('register')" class="btn-amber text-xs px-3.5 py-2 flex items-center gap-1.5 shadow-sm">
+              <i class="fa-solid fa-user-plus text-slate-900"></i> Patient Register
             </button>
-            <button onclick="openAuthModal()" class="btn-amber text-xs px-3.5 py-2">
-              <i class="fa-solid fa-right-to-bracket"></i> Sign In / Register
+            <button onclick="openAdminSignIn()" class="hidden sm:inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-bold text-white bg-slate-900 hover:bg-slate-800 transition">
+              <i class="fa-solid fa-lock text-amber-400"></i> Admin Sign In
             </button>
           </div>
 
@@ -1139,13 +1182,10 @@ HTML_TEMPLATE = """
               </div>
               <p id="navUserRoleTitle" class="text-[10px] text-slate-500 font-medium leading-none mt-0.5">Verified Patient</p>
             </div>
-            <div class="h-3.5 w-px bg-slate-200 mx-0.5 hidden sm:block"></div>
-            <button onclick="openAuthModal()" title="Switch Account" class="text-slate-400 hover:text-amber-600 text-xs px-1 font-bold">
-              <i class="fa-solid fa-arrows-rotate"></i>
-            </button>
-            <button onclick="handleLogout()" title="Sign Out" class="text-slate-400 hover:text-rose-500 transition text-xs p-1 flex items-center gap-1 font-semibold">
-              <i class="fa-solid fa-arrow-right-from-bracket"></i>
-              <span class="hidden md:inline text-[11px]">Sign Out</span>
+            <div class="h-3.5 w-px bg-slate-200 mx-1 hidden sm:block"></div>
+            <button onclick="handleLogout()" title="Logout" class="text-slate-500 hover:text-rose-600 transition text-xs px-2.5 py-1.5 rounded-lg hover:bg-rose-50 flex items-center gap-1.5 font-bold">
+              <i class="fa-solid fa-right-from-bracket text-rose-500"></i>
+              <span>Logout</span>
             </button>
           </div>
         </div>
@@ -1155,9 +1195,9 @@ HTML_TEMPLATE = """
   </header>
 
   <!-- ============================================================ -->
-  <!-- VIEW 1: PUBLIC HIGH-CONVERTING LANDING PAGE (DEFAULT VIEW)   -->
+  <!-- VIEW 1: PUBLIC HIGH-CONVERTING LANDING PAGE                  -->
   <!-- ============================================================ -->
-  <div id="view-landing" class="space-y-16 pb-20">
+  <div id="view-landing" class="hidden space-y-16 pb-20">
 
     <!-- Hero Section -->
     <section class="relative bg-gradient-to-b from-slate-900 via-navy-900 to-slate-950 text-white overflow-hidden pt-12 pb-20 px-4 sm:px-6 lg:px-8 border-b border-slate-800">
@@ -1180,11 +1220,11 @@ HTML_TEMPLATE = """
 
             <!-- Hero CTAs -->
             <div class="flex flex-wrap items-center gap-3 pt-2">
-              <button onclick="quickAccessLogin('patient')" class="btn-amber pulse-amber text-sm px-6 py-3.5">
-                <i class="fa-solid fa-hospital-user text-slate-900"></i> Enter Patient Portal
+              <button onclick="openAuthModal('signin')" class="btn-amber pulse-amber text-sm px-6 py-3.5">
+                <i class="fa-solid fa-right-to-bracket text-slate-900"></i> Enter Patient Portal
               </button>
-              <button onclick="quickAccessLogin('hospital_admin')" class="btn-navy text-sm px-6 py-3.5 border-slate-700 text-white hover:bg-slate-800">
-                <i class="fa-solid fa-hospital text-amber-400"></i> Enter Hospital Admin Hub
+              <button onclick="openAuthModal('register')" class="btn-navy text-sm px-6 py-3.5 border-slate-700 text-white hover:bg-slate-800">
+                <i class="fa-solid fa-user-plus text-amber-400"></i> Register New Patient
               </button>
               <a href="#emergency" class="btn-rose text-sm px-5 py-3.5">
                 <i class="fa-solid fa-truck-medical animate-bounce"></i> Emergency SOS Radar
@@ -1412,9 +1452,9 @@ HTML_TEMPLATE = """
   </div>
 
   <!-- ============================================================ -->
-  <!-- VIEW 2: AUTHENTICATED PATIENT PORTAL                         -->
+  <!-- PUBLIC PATIENT PORTAL (DEFAULT HOMEPAGE VIEW)                -->
   <!-- ============================================================ -->
-  <div id="view-patient" class="hidden max-w-screen-xl mx-auto px-4 sm:px-6 lg:px-8 py-6 space-y-6">
+  <div id="view-patient" class="max-w-screen-xl mx-auto px-4 sm:px-6 lg:px-8 py-6 space-y-6">
 
     <!-- Patient Header Banner -->
     <div class="card-navy text-white p-6 relative overflow-hidden flex flex-col md:flex-row md:items-center justify-between gap-4">
@@ -2216,12 +2256,22 @@ HTML_TEMPLATE = """
           <!-- Role Selector (Register Only) -->
           <div id="authRoleSelectField" class="hidden space-y-1">
             <label class="block text-[11px] font-bold text-slate-700">Enterprise Role Designation <span class="text-rose-500">*</span></label>
-            <select id="auth_role" class="input-field text-xs focus:ring-2 focus:ring-blue-500 transition">
-              <option value="patient">Patient / Healthcare Seeker</option>
-              <option value="hospital_admin">Hospital Desk Coordinator</option>
-              <option value="doctor">Consulting Physician</option>
-              <option value="ambulance">Emergency Fleet Dispatcher</option>
+            <select id="auth_role" onchange="handleAuthRoleChange(this.value)" class="input-field text-xs focus:ring-2 focus:ring-blue-500 transition">
+              <option value="patient" selected>Patient / Healthcare Seeker (Public)</option>
+              <option value="hospital_admin">Hospital Desk Coordinator (Passkey Required)</option>
+              <option value="doctor">Consulting Physician (Passkey Required)</option>
+              <option value="ambulance">Emergency Fleet Dispatcher (Passkey Required)</option>
             </select>
+          </div>
+
+          <!-- Passkey Field (Shown when hospital_admin or doctor or ambulance is selected) -->
+          <div id="authPasskeyField" class="hidden space-y-1">
+            <label class="block text-[11px] font-bold text-amber-800">Hospital Authorization Passkey <span class="text-rose-500">*</span></label>
+            <div class="relative">
+              <i class="fa-solid fa-shield-halved absolute left-3.5 top-3 text-amber-500 text-xs"></i>
+              <input type="password" id="auth_passkey" placeholder="Enter Staff Passkey (e.g., HOSP2026)" class="input-field text-xs pl-9 border-amber-300 bg-amber-50/50 focus:ring-2 focus:ring-amber-500 transition">
+            </div>
+            <p class="text-[10px] text-amber-700">Staff registration strictly requires authorization passkey <span class="font-mono font-bold">HOSP2026</span>.</p>
           </div>
 
           <div class="pt-2">
@@ -2354,7 +2404,13 @@ HTML_TEMPLATE = """
     // ----------------------------------------------------------------
     // AUTHENTICATION & CLINICAL IDENTITY MANAGEMENT
     // ----------------------------------------------------------------
+    function openAdminSignIn() {
+      openAuthModal('signin');
+      fillQuickCredentials('reception@resqlife.org', 'hospital_admin', 'Hospital Desk Coordinator');
+    }
+
     function fillQuickCredentials(email, roleKey, roleTitle) {
+      toggleAuthTab('signin');
       const emailInput = document.getElementById('auth_email');
       const passInput = document.getElementById('auth_password');
       if (emailInput) emailInput.value = email;
@@ -2367,7 +2423,6 @@ HTML_TEMPLATE = """
       };
       if (passInput) passInput.value = pwdMap[roleKey] || 'password123';
       hideAuthError();
-      quickAccessLogin(roleKey);
     }
 
     async function quickAccessLogin(roleKey) {
@@ -2413,59 +2468,69 @@ HTML_TEMPLATE = """
       const loggedOutNav = document.getElementById('loggedOutNavActions');
       const loggedInPill = document.getElementById('loggedInUserPill');
 
-      if (!currentUser) {
-        landingView.classList.remove('hidden');
-        patientView.classList.add('hidden');
-        adminView.classList.add('hidden');
-        loggedOutNav.classList.remove('hidden');
-        loggedInPill.classList.add('hidden');
-        return;
-      }
+      if (!currentUser || currentUser.role === 'patient') {
+        if (landingView) landingView.classList.add('hidden');
+        if (patientView) patientView.classList.remove('hidden');
+        if (adminView) adminView.classList.add('hidden');
 
-      loggedOutNav.classList.add('hidden');
-      loggedInPill.classList.remove('hidden');
-      const displayName = currentUser.full_name || currentUser.name || "User";
-      document.getElementById('navUserName').innerText = displayName;
-      document.getElementById('navUserRoleTitle').innerText = currentUser.role_title || "Verified Member";
-      document.getElementById('navRoleBadge').innerText = (currentUser.role || "USER").toUpperCase();
-      if (currentUser.role_badge) {
-        document.getElementById('navRoleBadge').className = `text-[9px] font-black uppercase tracking-wider px-1.5 py-0.5 rounded-full ${currentUser.role_badge}`;
-      }
+        if (!currentUser) {
+          if (loggedOutNav) loggedOutNav.classList.remove('hidden');
+          if (loggedInPill) loggedInPill.classList.add('hidden');
+          const patientWelcome = document.getElementById('patientWelcomeName');
+          if (patientWelcome) patientWelcome.innerText = "Patient Healthcare Portal";
+        } else {
+          if (loggedOutNav) loggedOutNav.classList.add('hidden');
+          if (loggedInPill) loggedInPill.classList.remove('hidden');
+          const displayName = currentUser.full_name || currentUser.name || "Patient";
+          document.getElementById('navUserName').innerText = displayName;
+          document.getElementById('navUserRoleTitle').innerText = currentUser.role_title || "Verified Patient";
+          document.getElementById('navRoleBadge').innerText = (currentUser.role || "PATIENT").toUpperCase();
+          if (currentUser.role_badge) {
+            document.getElementById('navRoleBadge').className = `text-[9px] font-black uppercase tracking-wider px-1.5 py-0.5 rounded-full ${currentUser.role_badge}`;
+          }
+          const patientWelcome = document.getElementById('patientWelcomeName');
+          if (patientWelcome) patientWelcome.innerText = `Welcome, ${displayName}`;
+        }
 
-      const parts = displayName.trim().split(/\s+/);
-      const initials = parts.length > 1 ? (parts[0][0] + parts[parts.length - 1][0]).toUpperCase() : displayName.substring(0, 2).toUpperCase();
-      const navInitials = document.getElementById('navUserInitials');
-      if (navInitials) navInitials.innerText = initials;
-      const navAvatar = document.getElementById('navUserAvatar');
-      if (navAvatar && currentUser.avatar) navAvatar.src = currentUser.avatar;
-
-      if (currentUser.role === 'patient') {
-        landingView.classList.add('hidden');
-        patientView.classList.remove('hidden');
-        adminView.classList.add('hidden');
-        document.getElementById('patientWelcomeName').innerText = `Welcome, ${displayName}`;
         renderPatientAppointments();
         renderPatientPrescriptions();
         renderPatientInvoices();
-      } else if (currentUser.role === 'hospital_admin' || currentUser.role === 'reception') {
-        landingView.classList.add('hidden');
-        patientView.classList.add('hidden');
-        adminView.classList.remove('hidden');
+        return;
+      }
+
+      if (currentUser.role === 'hospital_admin' || currentUser.role === 'reception') {
+        if (landingView) landingView.classList.add('hidden');
+        if (patientView) patientView.classList.add('hidden');
+        if (adminView) adminView.classList.remove('hidden');
+        if (loggedOutNav) loggedOutNav.classList.add('hidden');
+        if (loggedInPill) loggedInPill.classList.remove('hidden');
+
+        const displayName = currentUser.full_name || currentUser.name || "Hospital Admin";
+        document.getElementById('navUserName').innerText = displayName;
+        document.getElementById('navUserRoleTitle').innerText = currentUser.role_title || "Desk Coordinator";
+        document.getElementById('navRoleBadge').innerText = (currentUser.role || "ADMIN").toUpperCase();
+        if (currentUser.role_badge) {
+          document.getElementById('navRoleBadge').className = `text-[9px] font-black uppercase tracking-wider px-1.5 py-0.5 rounded-full ${currentUser.role_badge}`;
+        }
+
         renderAdminQueueTable();
         renderAdminDoctorsTable();
         renderAdminPrescriptions();
         renderAdminInvoicesTable();
         renderAdminFleetRadar();
       } else {
-        // Doctor or Fleet role fallback
-        landingView.classList.add('hidden');
-        patientView.classList.remove('hidden');
-        adminView.classList.add('hidden');
+        if (landingView) landingView.classList.add('hidden');
+        if (patientView) patientView.classList.remove('hidden');
+        if (adminView) adminView.classList.add('hidden');
+        renderPatientAppointments();
+        renderPatientPrescriptions();
+        renderPatientInvoices();
       }
     }
 
-    function openAuthModal() {
+    function openAuthModal(defaultTab = 'signin') {
       hideAuthError();
+      toggleAuthTab(defaultTab);
       document.getElementById('authModal').classList.remove('hidden');
     }
     function closeAuthModal() {
@@ -2505,6 +2570,17 @@ HTML_TEMPLATE = """
     }
     function hideAuthError() { showAuthError(null); }
 
+    function handleAuthRoleChange(role) {
+      const passkeyField = document.getElementById('authPasskeyField');
+      if (passkeyField) {
+        if (role === 'patient') {
+          passkeyField.classList.add('hidden');
+        } else {
+          passkeyField.classList.remove('hidden');
+        }
+      }
+    }
+
     let currentAuthTab = 'signin';
     function toggleAuthTab(tab) {
       currentAuthTab = tab;
@@ -2514,6 +2590,7 @@ HTML_TEMPLATE = """
       const nameField = document.getElementById('authRegisterNameField');
       const phoneField = document.getElementById('authRegisterPhoneField');
       const roleField = document.getElementById('authRoleSelectField');
+      const passkeyField = document.getElementById('authPasskeyField');
       const submitBtn = document.getElementById('authSubmitBtn');
       const passwordHint = document.getElementById('authPasswordHint');
 
@@ -2524,6 +2601,11 @@ HTML_TEMPLATE = """
         if (phoneField) phoneField.classList.remove('hidden');
         if (roleField) roleField.classList.remove('hidden');
         if (passwordHint) passwordHint.classList.remove('hidden');
+        const roleSel = document.getElementById('auth_role');
+        if (roleSel) {
+          roleSel.value = 'patient';
+          handleAuthRoleChange('patient');
+        }
         submitBtn.innerText = 'Create Enterprise Account';
       } else {
         signInBtn.className = 'text-xs font-extrabold pb-2 border-b-2 border-amber-500 text-slate-900 transition';
@@ -2531,6 +2613,7 @@ HTML_TEMPLATE = """
         if (nameField) nameField.classList.add('hidden');
         if (phoneField) phoneField.classList.add('hidden');
         if (roleField) roleField.classList.add('hidden');
+        if (passkeyField) passkeyField.classList.add('hidden');
         if (passwordHint) passwordHint.classList.add('hidden');
         submitBtn.innerText = 'Sign In to ResQLife Portal';
       }
@@ -2578,9 +2661,11 @@ HTML_TEMPLATE = """
         const nameInput = document.getElementById('auth_name');
         const phoneInput = document.getElementById('auth_phone');
         const roleInput = document.getElementById('auth_role');
+        const passkeyInput = document.getElementById('auth_passkey');
         const name = (nameInput ? nameInput.value : '').trim();
         const phone = (phoneInput ? phoneInput.value : '').trim();
         const role = roleInput ? roleInput.value : 'patient';
+        const passkey = (passkeyInput ? passkeyInput.value : '').trim();
 
         // 1. Full name min 3 chars
         if (name.length < 3) {
@@ -2612,6 +2697,13 @@ HTML_TEMPLATE = """
           return;
         }
 
+        // 5. Passkey required for clinical roles
+        if (role !== 'patient' && !passkey) {
+          showAuthError("Hospital Authorization Passkey (e.g. HOSP2026) is required for staff roles.");
+          if (passkeyInput) passkeyInput.focus();
+          return;
+        }
+
         try {
           const res = await fetch('/api/auth/register', {
             method: 'POST',
@@ -2622,18 +2714,21 @@ HTML_TEMPLATE = """
               email: email,
               phone: phone || cleanPhone,
               password: password,
-              role: role
+              role: role,
+              passkey: passkey
             })
           });
           const data = await res.json();
+          if (res.status === 403 || !data.success) {
+            showAuthError(data.error || "Registration rejected. Invalid passkey or credentials.");
+            return;
+          }
           if (data.success && data.user) {
             currentUser = data.user;
             localStorage.setItem('resqlife_session_user', JSON.stringify(currentUser));
             updateAuthUI();
             closeAuthModal();
             showToast("Account Created", `Registration successful. Welcome, ${currentUser.name || currentUser.full_name}!`);
-          } else {
-            showAuthError(data.error || "Registration failed. Please check your details.");
           }
         } catch(err) {
           showAuthError("Connection error. Please try again.");
@@ -3236,32 +3331,21 @@ HTML_TEMPLATE = """
         dateInput.value = new Date().toISOString().split('T')[0];
       }
 
-      // Maintain active session state cleanly across page reloads
-      const cachedSessionUser = localStorage.getItem('resqlife_session_user');
-      if (cachedSessionUser) {
-        try {
-          currentUser = JSON.parse(cachedSessionUser);
-          updateAuthUI();
-        } catch(e) {
-          localStorage.removeItem('resqlife_session_user');
-        }
-      }
+      // Default active view is strictly the Patient / Public Dashboard
+      currentUser = null;
+      updateAuthUI();
 
-      // Verify and synchronize active auth session with server
+      // Verify and synchronize active auth session with server if logged in
       fetch('/api/auth/me')
         .then(r => r.json())
         .then(data => {
           if (data.authenticated && data.user) {
             currentUser = data.user;
-            localStorage.setItem('resqlife_session_user', JSON.stringify(currentUser));
-            updateAuthUI();
-          } else if (!cachedSessionUser) {
-            currentUser = null;
             updateAuthUI();
           }
         })
         .catch(err => {
-          console.warn("Auth sync fallback:", err);
+          console.warn("Auth check fallback:", err);
         });
     });
   </script>

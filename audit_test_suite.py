@@ -4,6 +4,7 @@ import urllib.parse
 from app import app, appointments, blood_inventory, ambulances, prescriptions, HTML_TEMPLATE, DB_PATH
 
 def run_system_audit():
+    app.testing = True
     client = app.test_client()
     audit_results = {
         "perspective_1_patient": {},
@@ -267,12 +268,15 @@ def run_system_audit():
         assert u_data["success"] is True
         assert u_data["user"]["role"] == role_key
     
-    # Register test
-    res_reg = client.post('/api/auth/register', json={"name": "Audit Dr", "email": "audit.dr@med.org", "role": "doctor"})
+    # Register test (Hospital Authorization Passkey required for clinical roles)
+    res_reg_fail = client.post('/api/auth/register', json={"name": "Audit Dr", "email": "audit.dr@med.org", "role": "doctor", "password": "password123"})
+    assert res_reg_fail.status_code == 403
+    
+    res_reg = client.post('/api/auth/register', json={"name": "Audit Dr", "email": "audit.dr@med.org", "role": "doctor", "passkey": "HOSP2026", "password": "password123"})
     assert res_reg.status_code == 200
     assert res_reg.get_json()["user"]["role"] == "doctor"
 
-    audit_results["api_integrity"]["rbac_authentication"] = "PASSED (1-Click demo logins for all 4 roles + registration verified)"
+    audit_results["api_integrity"]["rbac_authentication"] = "PASSED (RBAC Passkey enforcement + 1-Click demo logins for all 4 roles + registration verified)"
 
     print("\n" + "=" * 60)
     print("ALL TEST PHASES COMPLETED!")
